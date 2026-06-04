@@ -14,6 +14,7 @@ import {Hooks} from "@uniswap/v4-core/libraries/Hooks.sol";
 import {TickMath} from "@uniswap/v4-core/libraries/TickMath.sol";
 
 import {NovaraHook} from "../src/NovaraHook.sol";
+import {NovaraReserve} from "../src/NovaraReserve.sol";
 
 contract NovaraHookTest is Test {
     using PoolIdLibrary for PoolKey;
@@ -33,12 +34,15 @@ contract NovaraHookTest is Test {
     event PositionExited(bytes32 indexed positionId, address indexed owner, uint256 timestamp);
 
     NovaraHook internal hook;
+    NovaraReserve internal reserve;
     PoolKey internal key;
     address internal owner = address(0xA11CE);
     address internal otherOwner = address(0xB0B);
 
     function setUp() public {
         hook = new NovaraHook();
+        reserve = new NovaraReserve(address(hook));
+        hook.setReserve(address(reserve));
         key = PoolKey({
             currency0: Currency.wrap(address(0x1111)),
             currency1: Currency.wrap(address(0x2222)),
@@ -115,6 +119,24 @@ contract NovaraHookTest is Test {
         assertFalse(afterSwapReturnDelta);
         assertFalse(afterAddLiquidityReturnDelta);
         assertFalse(afterRemoveLiquidityReturnDelta);
+    }
+
+    function test_ReserveLiabilityRecordedOnAdd() public {
+        int24 tickLower = -60;
+        int24 tickUpper = 60;
+
+        hook.afterAddLiquidity(
+            owner,
+            key,
+            ModifyLiquidityParams({tickLower: tickLower, tickUpper: tickUpper, liquidityDelta: 1e6, salt: bytes32(0)}),
+            BalanceDelta.wrap(0),
+            BalanceDelta.wrap(0),
+            _addHookData(0, _profile(true, false, 2500))
+        );
+
+        (, uint256 liabilities, uint256 coverage) = reserve.reserves(key.toId());
+        assertGt(liabilities, 0);
+        assertEq(coverage, 0);
     }
 
     function test_PositionCreated_InRange() public {
@@ -268,6 +290,9 @@ contract NovaraHookTest is Test {
             _addHookData(0, _profile(true, false, 2500))
         );
 
+        (, uint256 liabilitiesBefore, ) = reserve.reserves(key.toId());
+        assertGt(liabilitiesBefore, 0);
+
         bytes32 positionId = _positionId(owner, tickLower, tickUpper);
         vm.expectEmit(true, true, false, true, address(hook));
         emit PositionExited(positionId, owner, block.timestamp);
@@ -281,6 +306,10 @@ contract NovaraHookTest is Test {
 
         NovaraHook.Position memory position = _position(owner, tickLower, tickUpper);
         assertEq(uint8(position.state), uint8(NovaraHook.PositionState.EXITED));
+
+        (, uint256 liabilitiesAfter, uint256 coverageAfter) = reserve.reserves(key.toId());
+        assertEq(liabilitiesAfter, 0);
+        assertEq(coverageAfter, 10_000);
     }
 
     function test_CannotExitTwice() public {
@@ -359,5 +388,42 @@ contract NovaraHookTest is Test {
         NovaraHook.Position memory positionB = _position(otherOwner, tickLowerB, tickUpperB);
         assertEq(uint8(positionA.state), uint8(NovaraHook.PositionState.IDLE));
         assertEq(uint8(positionB.state), uint8(NovaraHook.PositionState.IDLE));
+    }
+
+    function test_ReserveLiabilityTracksStateTransitions() public {
+        int24 tickLower = -60;
+        int24 tickUpper = 60;
+
+        hook.afterAddLiquidity(
+            owner,
+            key,
+            ModifyLiquidityParams({tickLower: tickLower, tickUpper: tickUpper, liquidityDelta: 1e6, salt: bytes32(0)}),
+            BalanceDelta.wrap(0),
+            BalanceDelta.wrap(0),
+            _addHookData(0, _profile(true, false, 2500))
+        );
+
+        (, uint256 liabilitiesInRange, ) = reserve.reserves(key.toId());
+        assertGt(liabilitiesInRange, 0);
+
+        hook.beforeSwap(
+            owner,
+            key,
+            SwapParams({zeroForOne: true, amountSpecified: 100, sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(100)}),
+            _swapHookData(100)
+        );
+
+        (, uint256 liabilitiesOutOfRange, ) = reserve.reserves(key.toId());
+        assertEq(liabilitiesOutOfRange, 0);
+
+        hook.beforeSwap(
+            owner,
+            key,
+            SwapParams({zeroForOne: true, amountSpecified: 100, sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(0)}),
+            _swapHookData(0)
+        );
+
+        (, uint256 liabilitiesBackInRange, ) = reserve.reserves(key.toId());
+        assertGt(liabilitiesBackInRange, 0);
     }
 }
