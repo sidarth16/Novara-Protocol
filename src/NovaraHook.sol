@@ -11,11 +11,14 @@ import {Hooks} from "@uniswap/v4-core/libraries/Hooks.sol";
 import {TickMath} from "@uniswap/v4-core/libraries/TickMath.sol";
 
 import {BaseHook} from "./base/BaseHook.sol";
+import {IAggregatorV3Like} from "./interfaces/IAggregatorV3Like.sol";
+import {IAutomationCompatible} from "./interfaces/IAutomationCompatible.sol";
 import {NovaraAaveAdapter} from "./NovaraAaveAdapter.sol";
 import {ILCalculator} from "./libraries/ILCalculator.sol";
+import {ReserveMath} from "./libraries/ReserveMath.sol";
 import {NovaraReserve} from "./NovaraReserve.sol";
 
-contract NovaraHook is BaseHook {
+contract NovaraHook is BaseHook, IAutomationCompatible {
     /// @notice Lifecycle status for a protected LP position.
     enum PositionState {
         ACTIVE,
@@ -26,10 +29,12 @@ contract NovaraHook is BaseHook {
     /// @notice Position metadata tracked per LP range.
     struct Position {
         address owner;
+        PoolId poolId;
         int24 tickLower;
         int24 tickUpper;
         uint128 liquidity;
         uint160 entryPrice;
+        int24 lastTick;
         uint256 entryTimestamp;
         PositionState state;
     }
@@ -41,11 +46,25 @@ contract NovaraHook is BaseHook {
         uint256 exitCoverageThreshold;
     }
 
+    /// @notice Cached pool metadata used for callbacks and Aave routing.
+    struct PoolConfig {
+        address currency0;
+        address currency1;
+    }
+
     mapping(bytes32 => Position) public positions;
     mapping(bytes32 => ProtectionProfile) public profiles;
     mapping(PoolId => bytes32[]) internal poolPositions;
+    mapping(PoolId => PoolConfig) public poolConfigs;
+    mapping(PoolId => bytes32[]) public idlePositions;
+    mapping(bytes32 => bool) public isInIdleIndex;
+    PoolId public primaryPoolId;
+    bool public hasPrimaryPool;
     NovaraReserve public reserve;
     NovaraAaveAdapter public aaveAdapter;
+    IAggregatorV3Like public priceFeed;
+    address public reactiveContract;
+    address public chainlinkForwarder;
     address public immutable deployer;
 
     /// @notice Aave bookkeeping for positions that are temporarily deployed outside Uniswap.
@@ -92,6 +111,17 @@ contract NovaraHook is BaseHook {
 
     event AaveDepositSkipped(bytes32 indexed positionId, string reason);
 
+    event PriceExitedRange(bytes32 indexed positionId, PoolId indexed poolId, int24 currentTick);
+    event PriceEnteredRange(bytes32 indexed positionId, PoolId indexed poolId, int24 currentTick);
+    event RedeploymentTriggered(bytes32 indexed positionId, address triggeredBy, uint256 timestamp);
+    event ReserveHealthSnapshot(
+        PoolId indexed poolId,
+        uint256 totalAssets,
+        uint256 totalLiabilities,
+        uint256 coverageRatioBPS,
+        uint256 timestamp
+    );
+
     // TODO(Day 5): emit reserve-backed payout telemetry once IL compensation exists.
     event PositionExited(bytes32 indexed positionId, address indexed owner, uint256 timestamp);
 
@@ -102,6 +132,10 @@ contract NovaraHook is BaseHook {
     error ReserveAddressZero();
     error AaveAlreadyConfigured();
     error AaveAddressZero();
+    error PriceFeedAddressZero();
+    error ReactiveAddressZero();
+    error ForwarderAddressZero();
+    error UnauthorizedCaller();
     error NotDeployer();
 
     constructor() {
@@ -127,12 +161,104 @@ contract NovaraHook is BaseHook {
         aaveAdapter = NovaraAaveAdapter(aaveAdapter_);
     }
 
+    function setReactiveContract(address reactiveContract_) external onlyDeployer {
+        if (reactiveContract_ == address(0)) revert ReactiveAddressZero();
+        reactiveContract = reactiveContract_;
+    }
+
+    function setChainlinkForwarder(address chainlinkForwarder_) external onlyDeployer {
+        if (chainlinkForwarder_ == address(0)) revert ForwarderAddressZero();
+        chainlinkForwarder = chainlinkForwarder_;
+    }
+
+    function setPriceFeed(address priceFeed_) external onlyDeployer {
+        if (priceFeed_ == address(0)) revert PriceFeedAddressZero();
+        priceFeed = IAggregatorV3Like(priceFeed_);
+    }
+
+    modifier onlyAuthorizedCaller() {
+        if (msg.sender != reactiveContract && msg.sender != chainlinkForwarder) revert UnauthorizedCaller();
+        _;
+    }
+
     function getPosition(bytes32 positionId) external view returns (Position memory) {
         return positions[positionId];
     }
 
     function getProtectionProfile(bytes32 positionId) external view returns (ProtectionProfile memory) {
         return profiles[positionId];
+    }
+
+    function getIdlePositionCount(PoolId poolId) external view returns (uint256) {
+        return idlePositions[poolId].length;
+    }
+
+    function checkUpkeep(bytes calldata checkData) external view override returns (bool upkeepNeeded, bytes memory performData) {
+        if (address(priceFeed) == address(0)) return (false, bytes(""));
+
+        PoolId poolId = abi.decode(checkData, (PoolId));
+        bytes32[] storage idle = idlePositions[poolId];
+        if (idle.length == 0) return (false, bytes(""));
+
+        (, int256 price,,,) = priceFeed.latestRoundData();
+        if (price <= 0) return (false, bytes(""));
+
+        int24 currentTick = _priceToTick(price);
+        bytes32[] memory toRedeploy = new bytes32[](idle.length);
+        uint256 count;
+
+        for (uint256 i = 0; i < idle.length; i++) {
+            Position memory position = positions[idle[i]];
+            if (position.state != PositionState.IDLE) continue;
+            if (currentTick >= position.tickLower && currentTick < position.tickUpper) {
+                toRedeploy[count++] = idle[i];
+            }
+        }
+
+        if (count > 0) {
+            upkeepNeeded = true;
+            performData = abi.encode(poolId, toRedeploy, count, currentTick);
+        }
+    }
+
+    function performUpkeep(bytes calldata performData) external override onlyAuthorizedCaller {
+        (PoolId poolId, bytes32[] memory toRedeploy, uint256 count, int24 currentTick) =
+            abi.decode(performData, (PoolId, bytes32[], uint256, int24));
+
+        for (uint256 i = 0; i < count; i++) {
+            bytes32 positionId = toRedeploy[i];
+            Position storage position = positions[positionId];
+            if (position.owner == address(0) || position.state != PositionState.IDLE) continue;
+            if (currentTick < position.tickLower || currentTick >= position.tickUpper) continue;
+
+            _recallFromAaveByPosition(positionId);
+            _removeFromIdleIndex(poolId, positionId);
+            position.state = PositionState.ACTIVE;
+            position.lastTick = currentTick;
+            emit RedeploymentTriggered(positionId, msg.sender, block.timestamp);
+        }
+    }
+
+    function deployToAave(bytes32 positionId) external onlyAuthorizedCaller {
+        _deployToAaveByPosition(positionId);
+    }
+
+    function recallFromAave(bytes32 positionId) external onlyAuthorizedCaller {
+        _recallFromAaveByPosition(positionId);
+    }
+
+    function logReserveHealth() external onlyAuthorizedCaller {
+        if (!hasPrimaryPool) return;
+        PoolId poolId = primaryPoolId;
+        (uint256 totalAssets, uint256 totalLiabilities, ) = reserve.reserves(poolId);
+        uint256 coverageRatioBPS = ReserveMath.computeCoverageRatio(totalAssets, totalLiabilities);
+        emit ReserveHealthSnapshot(
+            poolId,
+            totalAssets,
+            totalLiabilities,
+            coverageRatioBPS,
+            block.timestamp
+        );
     }
 
     /// @notice Enables only the Day 1 hook callbacks.
@@ -167,10 +293,11 @@ contract NovaraHook is BaseHook {
     ) internal override returns (bytes4, BalanceDelta) {
         (int24 currentTick, ProtectionProfile memory profile) = _decodeAddHookData(hookData);
         uint128 liquidity = params.liquidityDelta > 0 ? uint128(uint256(params.liquidityDelta)) : 0;
-        bytes32 positionId =
-            addPosition(sender, key.toId(), key, params.tickLower, params.tickUpper, liquidity, currentTick, profile);
+        _ensurePoolConfig(key);
+        bytes32 positionId = addPosition(sender, key.toId(), params.tickLower, params.tickUpper, liquidity, currentTick, profile);
         if (!_isInRange(currentTick, params.tickLower, params.tickUpper)) {
-            _deployToAave(key.toId(), key, positionId, currentTick);
+            _addToIdleIndex(key.toId(), positionId);
+            emit PriceExitedRange(positionId, key.toId(), currentTick);
         }
         return (this.afterAddLiquidity.selector, BalanceDeltaLibrary.ZERO_DELTA);
     }
@@ -183,7 +310,8 @@ contract NovaraHook is BaseHook {
         returns (bytes4, BeforeSwapDelta, uint24)
     {
         int24 currentTick = _decodeSwapHookData(hookData);
-        bytes32[] storage ids = poolPositions[key.toId()];
+        PoolId poolId = key.toId();
+        bytes32[] storage ids = poolPositions[poolId];
 
         for (uint256 i = 0; i < ids.length; i++) {
             bytes32 positionId = ids[i];
@@ -192,22 +320,9 @@ contract NovaraHook is BaseHook {
 
             bool inRange = _isInRange(currentTick, position.tickLower, position.tickUpper);
             if (position.state == PositionState.ACTIVE && !inRange) {
-                position.state = PositionState.IDLE;
-                emit PositionStateChanged(positionId, PositionState.ACTIVE, PositionState.IDLE, currentTick);
-                if (address(reserve) != address(0)) {
-                    reserve.recordLiability(key.toId(), positionId, 0);
-                }
-                _deployToAave(key.toId(), key, positionId, currentTick);
+                _transitionActiveToIdle(poolId, positionId, position, currentTick);
             } else if (position.state == PositionState.IDLE && inRange) {
-                position.state = PositionState.ACTIVE;
-                emit PositionStateChanged(positionId, PositionState.IDLE, PositionState.ACTIVE, currentTick);
-                _recallFromAave(key.toId(), key, positionId, currentTick);
-                if (address(reserve) != address(0)) {
-                    uint256 exposure = ILCalculator.positionValue(
-                        TickMath.getSqrtPriceAtTick(currentTick), position.tickLower, position.tickUpper, position.liquidity
-                    );
-                    reserve.recordLiability(key.toId(), positionId, exposure);
-                }
+                _transitionIdleToActive(poolId, positionId, position, currentTick);
             }
         }
 
@@ -233,6 +348,7 @@ contract NovaraHook is BaseHook {
             ILCalculator.computeIL(position.entryPrice, exitPrice, position.tickLower, position.tickUpper, position.liquidity);
 
         position.state = PositionState.EXITED;
+        _removeFromIdleIndex(position.poolId, positionId);
         emit PositionExited(positionId, sender, block.timestamp);
 
         if (address(reserve) != address(0)) {
@@ -285,11 +401,133 @@ contract NovaraHook is BaseHook {
         return abi.decode(hookData, (int24));
     }
 
+    function _priceToTick(int256 chainlinkPrice) internal pure returns (int24 tick) {
+        if (chainlinkPrice <= 0) return 0;
+        uint256 price = uint256(chainlinkPrice);
+        uint256 sqrtPriceX96 = _sqrt((price << 192) / 1e8);
+        if (sqrtPriceX96 == 0) return 0;
+        if (sqrtPriceX96 > type(uint160).max) {
+            return TickMath.MAX_TICK;
+        }
+        return ILCalculator.sqrtPriceToTick(uint160(sqrtPriceX96));
+    }
+
+    function _sqrt(uint256 x) internal pure returns (uint256 y) {
+        if (x == 0) return 0;
+        uint256 z = (x + 1) / 2;
+        y = x;
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
+        }
+    }
+
+    function _addToIdleIndex(PoolId poolId, bytes32 positionId) internal {
+        if (isInIdleIndex[positionId]) return;
+        idlePositions[poolId].push(positionId);
+        isInIdleIndex[positionId] = true;
+    }
+
+    function _removeFromIdleIndex(PoolId poolId, bytes32 positionId) internal {
+        if (!isInIdleIndex[positionId]) return;
+        bytes32[] storage idle = idlePositions[poolId];
+        for (uint256 i = 0; i < idle.length; i++) {
+            if (idle[i] == positionId) {
+                idle[i] = idle[idle.length - 1];
+                idle.pop();
+                break;
+            }
+        }
+        isInIdleIndex[positionId] = false;
+    }
+
+    function _transitionActiveToIdle(PoolId poolId, bytes32 positionId, Position storage position, int24 currentTick)
+        internal
+    {
+        position.state = PositionState.IDLE;
+        position.lastTick = currentTick;
+        emit PositionStateChanged(positionId, PositionState.ACTIVE, PositionState.IDLE, currentTick);
+        _addToIdleIndex(poolId, positionId);
+        emit PriceExitedRange(positionId, poolId, currentTick);
+        if (address(reserve) != address(0)) {
+            reserve.recordLiability(poolId, positionId, 0);
+        }
+    }
+
+    function _transitionIdleToActive(PoolId poolId, bytes32 positionId, Position storage position, int24 currentTick)
+        internal
+    {
+        position.state = PositionState.ACTIVE;
+        position.lastTick = currentTick;
+        emit PositionStateChanged(positionId, PositionState.IDLE, PositionState.ACTIVE, currentTick);
+        _removeFromIdleIndex(poolId, positionId);
+        emit PriceEnteredRange(positionId, poolId, currentTick);
+        if (address(reserve) != address(0)) {
+            uint256 exposure = ILCalculator.positionValue(
+                TickMath.getSqrtPriceAtTick(currentTick), position.tickLower, position.tickUpper, position.liquidity
+            );
+            reserve.recordLiability(poolId, positionId, exposure);
+        }
+    }
+
+    function _deployToAaveByPosition(bytes32 positionId) internal {
+        Position storage position = positions[positionId];
+        if (position.owner == address(0) || position.state != PositionState.IDLE) return;
+        if (address(aaveAdapter) == address(0)) {
+            emit AaveDepositSkipped(positionId, "adapter not configured");
+            return;
+        }
+
+        PoolConfig memory config = poolConfigs[position.poolId];
+        address token = position.lastTick < position.tickLower ? config.currency0 : config.currency1;
+        uint256 amount = uint256(position.liquidity);
+        if (!aaveAdapter.canDeposit(token, amount)) {
+            emit AaveDepositSkipped(positionId, "insufficient liquidity");
+            return;
+        }
+
+        uint256 aTokenAmount = aaveAdapter.deposit(token, amount);
+        aaveDeposits[positionId] = AaveDeposit({
+            token: token,
+            aToken: token,
+            originalAmount: amount,
+            aTokenAmount: aTokenAmount,
+            depositTimestamp: block.timestamp
+        });
+
+        emit AaveDeployed(positionId, token, amount, aTokenAmount, block.timestamp);
+    }
+
+    function _recallFromAaveByPosition(bytes32 positionId) internal {
+        Position storage position = positions[positionId];
+        AaveDeposit memory deposit = aaveDeposits[positionId];
+        if (position.owner == address(0) || deposit.originalAmount == 0) return;
+        if (address(aaveAdapter) == address(0)) {
+            emit AaveDepositSkipped(positionId, "adapter not configured");
+            return;
+        }
+
+        uint256 tokenAmount = aaveAdapter.withdraw(deposit.token, deposit.aTokenAmount);
+        if (tokenAmount == 0) {
+            emit AaveDepositSkipped(positionId, "withdraw unavailable");
+            return;
+        }
+
+        uint256 yieldEarned = tokenAmount > deposit.originalAmount ? tokenAmount - deposit.originalAmount : 0;
+        if (yieldEarned > 0 && address(reserve) != address(0)) {
+            reserve.deposit(position.poolId, yieldEarned);
+        }
+
+        delete aaveDeposits[positionId];
+        _removeFromIdleIndex(position.poolId, positionId);
+        position.state = PositionState.ACTIVE;
+        emit AaveRecalled(positionId, deposit.token, deposit.originalAmount, yieldEarned, block.timestamp);
+    }
+
     /// @notice Stores a new or re-opened position and snapshots its entry state.
     function addPosition(
         address owner,
         PoolId poolId,
-        PoolKey calldata key,
         int24 tickLower,
         int24 tickUpper,
         uint128 liquidity,
@@ -309,10 +547,12 @@ contract NovaraHook is BaseHook {
 
         positions[positionId] = Position({
             owner: owner,
+            poolId: poolId,
             tickLower: tickLower,
             tickUpper: tickUpper,
             liquidity: liquidity,
             entryPrice: entryPrice,
+            lastTick: currentTick,
             entryTimestamp: block.timestamp,
             state: initialState
         });
@@ -330,7 +570,19 @@ contract NovaraHook is BaseHook {
         }
     }
 
-    function _deployToAave(PoolId poolId, PoolKey calldata key, bytes32 positionId, int24 currentTick) internal {
+    function _ensurePoolConfig(PoolKey calldata key) internal {
+        PoolConfig storage config = poolConfigs[key.toId()];
+        if (config.currency0 == address(0) && config.currency1 == address(0)) {
+            config.currency0 = Currency.unwrap(key.currency0);
+            config.currency1 = Currency.unwrap(key.currency1);
+        }
+        if (!hasPrimaryPool) {
+            primaryPoolId = key.toId();
+            hasPrimaryPool = true;
+        }
+    }
+
+    function _deployToAave(PoolKey calldata key, bytes32 positionId, int24 currentTick) internal {
         Position storage position = positions[positionId];
         if (position.owner == address(0) || position.state != PositionState.IDLE) return;
         if (address(aaveAdapter) == address(0)) {
@@ -379,5 +631,24 @@ contract NovaraHook is BaseHook {
         delete aaveDeposits[positionId];
         emit AaveRecalled(positionId, deposit.token, deposit.originalAmount, yieldEarned, block.timestamp);
         currentTick;
+    }
+
+    function _handleActiveToIdle(PoolKey calldata key, bytes32 positionId, int24 currentTick) internal {
+        if (address(reserve) != address(0)) {
+            reserve.recordLiability(key.toId(), positionId, 0);
+        }
+        _deployToAave(key, positionId, currentTick);
+    }
+
+    function _handleIdleToActive(PoolKey calldata key, bytes32 positionId, Position storage position, int24 currentTick)
+        internal
+    {
+        _recallFromAave(key.toId(), key, positionId, currentTick);
+        if (address(reserve) != address(0)) {
+            uint256 exposure = ILCalculator.positionValue(
+                position.entryPrice, position.tickLower, position.tickUpper, position.liquidity
+            );
+            reserve.recordLiability(key.toId(), positionId, exposure);
+        }
     }
 }
