@@ -21,36 +21,58 @@ import {AbstractReactive} from "../src/reactive/AbstractReactive.sol";
 
 contract MockAavePoolLikeFL is IAavePoolLike {
     mapping(address => ReserveData) internal reserves;
+    mapping(address => uint256) internal availableLiquidityByAsset;
     mapping(address => mapping(address => uint256)) internal balances;
+    address[] internal listedAssets;
+    mapping(address => bool) internal listed;
 
     function setReserve(address asset, uint256 availableLiquidity, uint128 currentLiquidityRate, address aTokenAddress)
         external
     {
         reserves[asset] = ReserveData({
-            availableLiquidity: availableLiquidity,
+            configuration: ReserveConfigurationMap({data: 0}),
+            liquidityIndex: 1e27,
             currentLiquidityRate: currentLiquidityRate,
-            aTokenAddress: aTokenAddress
+            variableBorrowIndex: 1e27,
+            currentVariableBorrowRate: 0,
+            currentStableBorrowRate: 0,
+            lastUpdateTimestamp: uint40(block.timestamp),
+            id: 0,
+            aTokenAddress: aTokenAddress,
+            stableDebtTokenAddress: address(0),
+            variableDebtTokenAddress: address(0),
+            interestRateStrategyAddress: address(0),
+            accruedToTreasury: 0,
+            unbacked: 0,
+            isolationModeTotalDebt: 0
         });
+        availableLiquidityByAsset[asset] = availableLiquidity;
+        if (!listed[asset]) {
+            listed[asset] = true;
+            listedAssets.push(asset);
+        }
     }
 
     function supply(address asset, uint256 amount, address onBehalfOf, uint16) external {
-        ReserveData storage reserve = reserves[asset];
-        require(amount <= reserve.availableLiquidity, "insufficient liquidity");
-        reserve.availableLiquidity -= amount;
+        require(amount <= availableLiquidityByAsset[asset], "insufficient liquidity");
+        availableLiquidityByAsset[asset] -= amount;
         balances[onBehalfOf][asset] += amount;
     }
 
     function withdraw(address asset, uint256 amount, address to) external returns (uint256 withdrawn) {
         to;
-        ReserveData storage reserve = reserves[asset];
         uint256 balance = balances[msg.sender][asset];
         withdrawn = amount > balance ? balance : amount;
         balances[msg.sender][asset] = balance - withdrawn;
-        reserve.availableLiquidity += withdrawn;
+        availableLiquidityByAsset[asset] += withdrawn;
     }
 
     function getReserveData(address asset) external view returns (ReserveData memory) {
         return reserves[asset];
+    }
+
+    function getReservesList() external view returns (address[] memory) {
+        return listedAssets;
     }
 }
 
