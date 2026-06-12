@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IAavePoolLike} from "./interfaces/IAavePoolLike.sol";
 
 /// @title NovaraAaveAdapter
@@ -31,6 +32,7 @@ contract NovaraAaveAdapter {
     event WithdrawalTracked(address indexed asset, uint256 amount, uint256 yieldAmount, uint256 timestamp);
 
     error OnlyHook();
+    error ReserveDataReadFailed();
 
     constructor(address aavePool_, address hook_) {
         require(aavePool_ != address(0), "pool zero");
@@ -49,9 +51,14 @@ contract NovaraAaveAdapter {
     function deposit(address token, uint256 amount) external onlyHook returns (uint256 aTokenAmount) {
         if (amount == 0) return 0;
 
-        IAavePoolLike.ReserveData memory reserveData = aavePool.getReserveData(token);
-        address aToken = reserveData.aTokenAddress == address(0) ? token : reserveData.aTokenAddress;
+        (address aToken,,) = _readReserveData(token);
+        if (aToken == address(0)) {
+            aToken = token;
+        }
 
+        if (token.code.length > 0) {
+            IERC20(token).approve(address(aavePool), amount);
+        }
         aavePool.supply(token, amount, address(this), 0);
 
         deposits[aToken] = DepositState({
@@ -95,14 +102,18 @@ contract NovaraAaveAdapter {
 
     /// @notice Returns the current supply APY for the asset, in basis points.
     function currentAPY(address token) public view returns (uint256 apyBPS) {
-        IAavePoolLike.ReserveData memory reserveData = aavePool.getReserveData(token);
-        apyBPS = (uint256(reserveData.currentLiquidityRate) * BPS) / RAY;
+        (, uint256 currentLiquidityRate,) = _readReserveData(token);
+        apyBPS = (currentLiquidityRate * BPS) / RAY;
     }
 
     /// @notice Returns true when the pool advertises enough liquidity for the deposit.
     function canDeposit(address token, uint256 amount) public view returns (bool) {
         if (amount == 0) return false;
-        return aavePool.getReserveData(token).availableLiquidity >= amount;
+        (address aToken, uint256 currentLiquidityRate, uint256 availableLiquidity) = _readReserveData(token);
+        if (availableLiquidity > 0) {
+            return availableLiquidity >= amount;
+        }
+        return aToken != address(0) && currentLiquidityRate > 0;
     }
 
     /// @notice Returns true when the tracked deposit can be withdrawn.
@@ -112,7 +123,36 @@ contract NovaraAaveAdapter {
     }
 
     function _aTokenFor(address token) internal view returns (address aToken) {
-        IAavePoolLike.ReserveData memory reserveData = aavePool.getReserveData(token);
-        aToken = reserveData.aTokenAddress == address(0) ? token : reserveData.aTokenAddress;
+        (aToken,,) = _readReserveData(token);
+        if (aToken == address(0)) {
+            aToken = token;
+        }
+    }
+
+    function _readReserveData(address token)
+        internal
+        view
+        returns (address aToken, uint256 currentLiquidityRate, uint256 availableLiquidity)
+    {
+        (bool ok, bytes memory data) =
+            address(aavePool).staticcall(abi.encodeWithSelector(IAavePoolLike.getReserveData.selector, token));
+        if (!ok || data.length == 0) revert ReserveDataReadFailed();
+
+        // Mock layout: (availableLiquidity, currentLiquidityRate, aTokenAddress)
+        if (data.length == 96) {
+            (availableLiquidity, currentLiquidityRate, aToken) = abi.decode(data, (uint256, uint128, address));
+            return (aToken, currentLiquidityRate, availableLiquidity);
+        }
+
+        // Live Aave layout: 15-word reserve tuple.
+        if (data.length >= 15 * 32) {
+            assembly {
+                currentLiquidityRate := mload(add(data, 0x60))
+                aToken := mload(add(data, 0x120))
+            }
+            return (aToken, currentLiquidityRate, 0);
+        }
+
+        revert ReserveDataReadFailed();
     }
 }
