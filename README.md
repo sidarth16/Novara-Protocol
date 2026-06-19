@@ -2,8 +2,11 @@
 
 > **Zero dead capital. Zero unprotected exposure.**
 
-Novara is a self-sustaining LP capital management hook for Uniswap v4.  
-It eliminates two simultaneous failures of concentrated liquidity — idle capital and unprotected active capital — through a single unified economic loop.
+Novara is a self-sustaining LP capital management hook for Uniswap v4. It eliminates two simultaneous failures of concentrated liquidity — idle capital and unprotected active capital — through a single unified economic loop.
+
+When a position is out of range, Novara automatically deploys the idle liquidity to Aave to earn yield. That yield flows into an on-chain reserve, which pays out LPs for impermanent loss when they exit an active position. No external insurer, no token incentives, no emissions — the system funds its own protection.
+
+Built with Uniswap v4 Hooks, Aave v3, Chainlink, and Reactive Network for the UHI9 Hookathon (*Impermanent Loss & Yield Systems*).
 
 ---
 
@@ -24,6 +27,7 @@ It eliminates two simultaneous failures of concentrated liquidity — idle capit
 13. [Test Coverage Plan](#test-coverage-plan)
 14. [Demo Flow](#demo-flow)
 15. [Deployment](#deployment)
+16. [Team](#team)
 
 ---
 
@@ -583,42 +587,6 @@ This is a **feature, not a limitation.** LPs see a real coverage ratio (e.g. 23%
 
 ---
 
-## MVP vs Future Work
-
-### MVP (3 weeks — Hackathon Submission)
-
-**Contracts:**
-- [ ] `NovaraHook.sol` — core hook with all 5 callbacks
-- [ ] `NovaraReserve.sol` — reserve accounting
-- [ ] `NovaraAaveAdapter.sol` — Aave v3 integration
-- [ ] `NovaraReactive.sol` — Reactive Network RSC
-
-**Functionality:**
-- [ ] Position creation with entry price snapshot
-- [ ] Out-of-range detection via tick crossing in `beforeSwap`
-- [ ] Aave deposit of idle tokens (triggered by Reactive callback)
-- [ ] Aave yield routing to reserve
-- [ ] Chainlink Automation for range re-entry detection
-- [ ] Liquidity redeployment on range re-entry
-- [ ] IL computation on exit
-- [ ] Proportional payout from reserve
-- [ ] Coverage ratio display
-
-**Testing:**
-- [ ] 20+ unit tests covering all state transitions
-- [ ] Integration test: full lifecycle (deposit → idle → yield → re-enter → exit with payout)
-- [ ] Fork test on Sepolia with real Aave
-
-**Frontend:**
-- [ ] LP dashboard: position state, coverage ratio, current APY, estimated payout
-- [ ] Reserve health panel: total assets, total liabilities, coverage ratio history
-- [ ] Demo mode: time-compressed simulation showing full loop
-
-**Deployment:**
-- [ ] Sepolia testnet
-- [ ] Reactive Network Lasna testnet
-
----
 
 ### Post-Hackathon / Grant Work
 
@@ -681,7 +649,7 @@ This is a **feature, not a limitation.** LPs see a real coverage ratio (e.g. 23%
 | `EdgeCases.t.sol` | Tick boundaries, zero liquidity, coverage below 100%, Aave failure |
 | `SecurityTests.t.sol` | Reserve drain attempt, flash loan manipulation, reentrancy |
 
-**Target: 25+ tests, all passing before submission.**
+<!-- **Target: 25+ tests, all passing before submission.** -->
 
 ---
 
@@ -713,29 +681,6 @@ The demo tells a complete story in 90 seconds:
 
 ---
 
-## Deployment
-
-### Testnet
-
-| Contract | Network | Address |
-|----------|---------|---------|
-| NovaraHook | Sepolia | TBD |
-| NovaraReserve | Sepolia | TBD |
-| NovaraAaveAdapter | Sepolia | TBD |
-| NovaraReactive | Lasna (Reactive Network) | TBD |
-
-### Environment
-
-```bash
-# Required env vars
-SEPOLIA_RPC_URL=
-PRIVATE_KEY=
-AAVE_V3_POOL_SEPOLIA=0x6Ae43d3271ff6888e7Fc43Fd7321a503ff738951
-CHAINLINK_ETH_USD_SEPOLIA=0x694AA1769357215DE4FAC081bf1f309aDC325306
-CHAINLINK_AUTOMATION_REGISTRY_SEPOLIA=0x86EFBD0b6736Bed994962f9797049422A3A8E8Ad
-REACTIVE_NETWORK_RPC=
-UNISWAP_V4_POOL_MANAGER_SEPOLIA=0x...
-```
 
 ### Build & Test
 
@@ -772,7 +717,7 @@ forge script script/DeployNovara.s.sol --rpc-url $SEPOLIA_RPC_URL --broadcast
 │   Stack:                                                         │
 │   Uniswap v4 hooks + Aave v3 + Chainlink + Reactive Network      │
 │                                                                  │
-│   Status: Building                                               │
+│   Status: Building                                                │
 │                                                                  │
 └──────────────────────────────────────────────────────────────────┘
 ```
