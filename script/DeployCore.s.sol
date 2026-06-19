@@ -24,7 +24,8 @@ contract DeployCore is Script {
     uint256 internal constant INITIAL_PRICE = 100_000_000;
 
     function run() external {
-        uint256 privateKey = vm.envOr("PRIVATE_KEY", DEFAULT_PRIVATE_KEY);
+        // uint256 privateKey = vm.envOr("PRIVATE_KEY", DEFAULT_PRIVATE_KEY);
+        uint256 privateKey = vm.envUint("PRIVATE_KEY");
         address broadcaster = vm.addr(privateKey);
         string memory deploymentTag = vm.envOr("NOVARA_DEPLOYMENT_TAG", DEFAULT_DEPLOYMENT_TAG);
         address registryAddress = _registryAddress(broadcaster, deploymentTag);
