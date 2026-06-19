@@ -26,8 +26,6 @@ Built with Uniswap v4 Hooks, Aave v3, Chainlink, and Reactive Network for the UH
 12. [Security Assumptions](#security-assumptions)
 13. [Test Coverage Plan](#test-coverage-plan)
 14. [Demo Flow](#demo-flow)
-15. [Deployment](#deployment)
-16. [Team](#team)
 
 ---
 
